@@ -1,0 +1,26 @@
+# Ignore the target directory, where compiled binaries and dependencies are stored
+/target/
+
+# Cargo.lock can be ignored for libraries, but include it for binaries
+# This is only optional for libraries, it's usually best to include it for binaries
+# Cargo.lock
+
+# Ignore build artifacts
+**/*.rs.bk
+
+# If you use IDEs or editors, you might also want to ignore their configuration files:
+# For VS Code
+/.vscode/
+
+# For JetBrains IDEs (IntelliJ IDEA, CLion)
+/.idea/
+/*.iml
+
+# For Sublime Text
+/*.sublime-workspace
+/*.sublime-project
+
+# For other temporary files
+*.log
+*.tmp
+*.swp

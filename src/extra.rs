@@ -1,3 +1,64 @@
+use actix_web::{web, App, HttpServer};
+use tokio::task;
+use std::sync::Arc;
+use actix_cors::Cors;
+
+// Importing modules containing functionalities
+mod graph_disc;
+mod query;
+mod solana_connection;
+
+// Importing specific functionalities from the modules
+use graph_disc::GraphDatabase;
+use query::{query_discriminators_endpoint, query_instructions_endpoint,  upload_discriminator_endpoint };
+use solana_connection::SolanaConnection;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    println!("Hello World!");
+    let db = Arc::new(GraphDatabase::new("http://localhost:8529", "root", "Jayyu@1234", "disc_dir").await.unwrap());
+
+        // Create the required collections if they don't exist
+        db.create_required_collections().await.unwrap();
+
+    let solana_client = Arc::new(SolanaConnection::new("https://api.devnet.solana.com"));
+
+        // Fetch the list of program IDs from the database
+        let program_ids = db.get_all_program_ids().await.unwrap();
+
+    for program_id in program_ids {
+        let db_clone = db.clone();
+        let solana_client_clone = solana_client.clone();
+        let program_id_clone = program_id.clone();
+
+        // Spawn a new task for the real-time listener
+        task::spawn(async move {
+            (&solana_client_clone).real_time_listener(db_clone, program_id_clone).await;
+        });
+    }
+    
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::from(db.clone()))
+            .app_data(web::Data::from(solana_client.clone()))
+            .wrap(Cors::default() // CORS configuration
+            .allow_any_origin()  // Allow any origin for testing purposes, restrict in production
+            .allow_any_method()
+            .allow_any_header()
+        )
+            .service(
+                web::scope("")
+                    .route("/", web::get().to(|| async { "Hello World!" }))
+                    .route("/upload_discriminator/{program_id}", web::post().to(upload_discriminator_endpoint))
+                    .route("/query_discriminators/{program_id}", web::get().to(query_discriminators_endpoint))
+                    .route("/query_instructions/{discriminator_id}", web::get().to(query_instructions_endpoint))
+            )
+    })
+    .bind("127.0.0.1:8080")?
+    .run()
+    .await
+}
+
 use arangors::client::reqwest::ReqwestClient;
 use arangors::database::Database;
 use arangors::document::options::InsertOptions;
@@ -280,4 +341,183 @@ impl GraphDatabase {
 
 fn sanitize_key(input: &str) -> String {
     input.replace("/", "_") // Replace invalid characters with underscores or any valid character
+}
+
+
+use std::str::FromStr;
+use std::sync::Arc;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::account::Account;
+use solana_sdk::commitment_config::CommitmentConfig;
+use crate::graph_disc::GraphDatabase;
+use solana_sdk::pubkey::Pubkey;
+use tokio::task; // Import tokio task for blocking operations
+
+pub struct SolanaConnection {
+    client: Arc<RpcClient>,
+}
+
+impl SolanaConnection {
+    pub fn new(url: &str) -> Self {
+        let client = Arc::new(RpcClient::new_with_commitment(url.to_string(), CommitmentConfig::confirmed()));
+        SolanaConnection { client }
+    }
+
+    // Use spawn_blocking for RPC calls
+    pub async fn get_program_accounts(&self, program_id: &str) -> Result<Vec<(Pubkey, Account)>, String> {
+        let program_id = Pubkey::from_str(program_id).map_err(|e| e.to_string())?;
+        let client = self.client.clone();
+
+        // Move the RPC call to a blocking task
+        task::spawn_blocking(move || {
+            client.get_program_accounts(&program_id).map_err(|e| e.to_string())
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn real_time_listener(
+        &self, 
+        db: Arc<GraphDatabase>,
+        program_id: String,
+    ) {
+        loop {
+            // Fetch real-time events for the given program and account using async RPC
+            match self.get_program_accounts(&program_id).await {
+                Ok(accounts) => {
+                    for (pub_key, account) in accounts {
+                        let discriminator = &account.data[0..8];
+                        let discriminator_str = hex::encode(discriminator);
+                        let instruction_data = &account.data[0..4];
+                        let instruction = hex::encode(instruction_data); // Converts binary data to a hex string
+
+
+                        if let Err(e) = db.upload_discriminator(
+                            &program_id,
+                            &discriminator_str,
+                            &instruction,
+                            &pub_key.to_string(),
+                        ).await {
+                            eprintln!("Failed to store event data: {}", e);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error fetching real-time events: {:?}", e),
+            }
+    
+            // Sleep for a short interval to prevent spamming the blockchain
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
+}
+
+// Implement the Clone trait manually
+impl Clone for SolanaConnection {
+    fn clone(&self) -> Self {
+        SolanaConnection {
+            client: Arc::clone(&self.client),
+        }
+    }
+}
+
+
+use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use crate::graph_disc::GraphDatabase;
+use crate::solana_connection::SolanaConnection;
+
+
+pub async fn query_discriminators_endpoint(
+    db: web::Data<GraphDatabase>,
+    solana_client: web::Data<SolanaConnection>,
+    program_id: web::Path<String>,
+) -> impl Responder {
+    let program_id = program_id.into_inner();
+
+    // Check if discriminators are in the database
+    let discriminators = db.query_discriminators(&program_id).await;
+
+    match discriminators {
+        Ok(discriminators) => {
+            if !discriminators.is_empty() {
+                HttpResponse::Ok().json(discriminators)
+            } else {
+                // If not found in DB, fetch from Solana
+                let accounts_result = solana_client.get_program_accounts(&program_id);
+
+                match accounts_result.await {
+                    Ok(accounts) => {
+                        let mut uploaded_any = false;
+                        for (pub_key, account) in accounts {
+                            // Extract the discriminator from account data
+                            let discriminator = &account.data[0..8];
+                            let discriminator_str = hex::encode(discriminator);
+                            let instruction_data = &account.data[0..4];
+                            let instruction = hex::encode(instruction_data); // Converts binary data to a hex string
+
+                            if let Err(e) = db.upload_discriminator(
+                                &program_id,
+                                &discriminator_str,
+                                &instruction, 
+                                &pub_key.to_string(),
+                            ).await {
+                                return HttpResponse::InternalServerError().body(e.to_string());
+                            }
+
+                            uploaded_any = true;
+                        }
+
+                        if uploaded_any {
+                            let disc = db.query_discriminators(&program_id).await;
+                            match disc {
+                                Ok(disc) => HttpResponse::Ok().json(disc),
+                                Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+                            }
+                        } else {
+                            HttpResponse::NotFound().body("No discriminators found in Solana accounts")
+                        }
+                    }
+                    Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+                }
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
+}
+
+
+pub async fn query_instructions_endpoint(
+    db: web::Data<GraphDatabase>,
+    discriminator_id: web::Path<String>,
+) -> impl Responder {
+    let discriminator_id = discriminator_id.into_inner();
+
+    match db.query_instructions(&discriminator_id).await {
+        Ok(instructions) => HttpResponse::Ok().json(instructions),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
+}
+
+pub async fn upload_discriminator_endpoint(
+    db: web::Data<GraphDatabase>,
+    program_id: web::Path<String>,
+    discriminator_info: web::Json<(String, String, String)>,
+    req: HttpRequest,
+) -> impl Responder {
+    let program_id = program_id.into_inner();
+    let (discriminator, instruction, _) = discriminator_info.into_inner();
+
+    // Extract user_id from the headers
+    let user_id = match req.headers().get("user_id") {
+        Some(value) => match value.to_str() {
+            Ok(v) => v.to_string(),
+            Err(_) => return HttpResponse::BadRequest().body("Invalid user_id header value"),
+        },
+        None => return HttpResponse::BadRequest().body("Missing user_id header"),
+    };
+
+    match db
+        .upload_discriminator(&program_id, &discriminator, &instruction, &user_id)
+        .await
+    {
+        Ok(_) => HttpResponse::Ok().body("Discriminator uploaded successfully"),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
 }

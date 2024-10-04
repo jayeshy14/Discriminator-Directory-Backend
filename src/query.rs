@@ -1,7 +1,7 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use crate::graph_disc::GraphDatabase;
 use crate::solana_connection::SolanaConnection;
-use crate::DiscriminatorFetcher;
+
 
 pub async fn query_discriminators_endpoint(
     db: web::Data<GraphDatabase>,
@@ -16,35 +16,51 @@ pub async fn query_discriminators_endpoint(
     match discriminators {
         Ok(discriminators) => {
             if !discriminators.is_empty() {
-                return HttpResponse::Ok().json(discriminators);
+                HttpResponse::Ok().json(discriminators)
             } else {
                 // If not found in DB, fetch from Solana
-                let accounts_result =  solana_client.get_program_accounts(&program_id);
+                let accounts_result = solana_client.get_program_accounts(&program_id);
 
-                match accounts_result {
+                match accounts_result.await {
                     Ok(accounts) => {
-                        // Fetch discriminators from accounts
-                        let discriminators = DiscriminatorFetcher::fetch_discriminators(&accounts);
-                        match discriminators {
-                            Ok(discriminators) => {
-                                // Save to database
-                                for discriminator in &discriminators {
-                                    if let Err(e) = db.upload_discriminator(&program_id, discriminator, "instruction_placeholder", "user_placeholder").await {
-                                        return HttpResponse::InternalServerError().body(e.to_string());
-                                    }
-                                }
-                                return HttpResponse::Ok().json(discriminators);
+                        let mut uploaded_any = false;
+                        for (pub_key, account) in accounts {
+                            // Extract the discriminator from account data
+                            let discriminator = &account.data[0..8];
+                            let discriminator_str = hex::encode(discriminator);
+                            let instruction_data = &account.data[0..4];
+                            let instruction = hex::encode(instruction_data); // Converts binary data to a hex string
+
+                            if let Err(e) = db.upload_discriminator(
+                                &program_id,
+                                &discriminator_str,
+                                &instruction, 
+                                &pub_key.to_string(),
+                            ).await {
+                                return HttpResponse::InternalServerError().body(e.to_string());
                             }
-                            Err(e) => return HttpResponse::InternalServerError().body(e),
+
+                            uploaded_any = true;
+                        }
+
+                        if uploaded_any {
+                            let disc = db.query_discriminators(&program_id).await;
+                            match disc {
+                                Ok(disc) => HttpResponse::Ok().json(disc),
+                                Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+                            }
+                        } else {
+                            HttpResponse::NotFound().body("No discriminators found in Solana accounts")
                         }
                     }
-                    Err(e) => return HttpResponse::InternalServerError().body(e),
+                    Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
                 }
             }
         }
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
 }
+
 
 pub async fn query_instructions_endpoint(
     db: web::Data<GraphDatabase>,
@@ -84,18 +100,3 @@ pub async fn upload_discriminator_endpoint(
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
 }
-
-// pub async fn listen_program_endpoint(
-//     db: web::Data<GraphDatabase>,
-//     solana_client: web::Data<SolanaConnection>,
-//     program_id: web::Path<String>,
-// ) -> impl Responder {
-//     let program_id = program_id.into_inner();
-
-//     let result = solana_client.program_listener(&program_id, db.get_ref().clone()).await;
-
-//     match result {
-//         Ok(_) => HttpResponse::Ok().body("Program listening started"),
-//         Err(e) => HttpResponse::InternalServerError().body(e),
-//     }
-// }
