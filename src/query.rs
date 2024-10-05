@@ -11,7 +11,7 @@ pub async fn query_discriminators_endpoint(
     let program_id = program_id.into_inner();
 
     // Check if discriminators are in the database
-    let discriminators = db.query_discriminators(&program_id).await;
+    let discriminators = db.query_discriminators_and_instructions(&program_id).await;
 
     match discriminators {
         Ok(discriminators) => {
@@ -44,7 +44,7 @@ pub async fn query_discriminators_endpoint(
                         }
 
                         if uploaded_any {
-                            let disc = db.query_discriminators(&program_id).await;
+                            let disc = db.query_discriminators_and_instructions(&program_id).await;
                             match disc {
                                 Ok(disc) => HttpResponse::Ok().json(disc),
                                 Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
@@ -68,7 +68,7 @@ pub async fn query_instructions_endpoint(
 ) -> impl Responder {
     let discriminator_id = discriminator_id.into_inner();
 
-    match db.query_instructions(&discriminator_id).await {
+    match db.fetch_instructions_by_discriminator(&discriminator_id).await {
         Ok(instructions) => HttpResponse::Ok().json(instructions),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
