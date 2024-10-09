@@ -60,11 +60,18 @@ async fn main() -> std::io::Result<()> {
 }
 
 
+use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
-use solana_client::rpc_client::RpcClient;
+use serde::Deserialize;
+use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
+use solana_client::rpc_response::RpcConfirmedTransactionStatusWithSignature;
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::instruction::CompiledInstruction;
+use solana_sdk::signature::Signature;
+use solana_sdk::transaction::Transaction;
+use solana_transaction_status::{EncodedTransactionWithStatusMeta, UiTransactionEncoding};
 use crate::graph_disc::GraphDatabase;
 use solana_sdk::pubkey::Pubkey;
 use tokio::task; // Import tokio task for blocking operations
@@ -89,6 +96,19 @@ impl SolanaConnection {
             client.get_program_accounts(&program_id).map_err(|e| e.to_string())
         }).await.map_err(|e| e.to_string())?
     }
+
+    pub fn get_transactions(&self, program_id: &str) -> Result<Vec<RpcConfirmedTransactionStatusWithSignature>, Box<dyn std::error::Error>>{
+        let client = self.client.clone();
+        let program_pubkey = match Pubkey::from_str(program_id) {
+            Ok(pubkey) => pubkey,
+            Err(e) => return Err(e.to_string().into()),
+        };
+
+        // Fetch signatures
+        let signatures = client.get_signatures_for_address(&program_pubkey)?;
+        Ok(signatures)
+    }
+
 
     pub async fn real_time_listener(
         &self, 
@@ -123,6 +143,9 @@ impl SolanaConnection {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         }
     }
+
+
+    
 }
 
 // Implement the Clone trait manually
@@ -135,12 +158,14 @@ impl Clone for SolanaConnection {
 }
 
 
+
 use arangors::client::reqwest::ReqwestClient;
 use arangors::database::Database;
 use arangors::document::options::InsertOptions;
 use arangors::Connection;
 use arangors::ClientError;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
@@ -149,13 +174,13 @@ use thiserror::Error;
 
 // Structs for representing documents in the ArangoDB
 #[derive(Debug, Serialize, Deserialize)]
-struct Program {
+pub struct Program {
     _key: String,
     id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Discriminator {
+pub struct Discriminator {
     _key: String,
     value: String,
     instruction: String,
@@ -163,32 +188,32 @@ struct Discriminator {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Instruction {
+pub struct Instruction {
     _key: String,
     value: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct User {
+pub struct User {
     _key: String,
     id: String,
 }
 
 // Structs for representing edges in the ArangoDB graph
 #[derive(Debug, Serialize, Deserialize)]
-struct HasDiscriminator {
+pub struct HasDiscriminator {
     _from: String,
     _to: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct MappedTo {
+pub struct MappedTo {
     _from: String,
     _to: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct ContributedBy {
+pub struct ContributedBy {
     _from: String,
     _to: String,
 }
@@ -198,14 +223,14 @@ struct ContributedBy {
 pub enum DatabaseError {
     #[error("ArangoDB client error: {0}")]
     ClientError(#[from] ClientError),
-    
+
     #[error("Failed to insert document into {collection}: {source}")]
     DocumentInsertionError {
         collection: String,
         #[source]
         source: ClientError,
     },
-    
+
     #[error("Failed to execute AQL query: {query} - {source}")]
     AqlQueryError {
         query: String,
@@ -247,7 +272,7 @@ impl GraphDatabase {
     pub async fn new(uri: &str, user: &str, password: &str, db_name: &str) -> Result<Self, Box<dyn Error>> {
         let connection = Connection::establish_jwt(uri, user, password).await?;
         let db = connection.db(db_name).await?;
-        
+
         let program_collection = db.collection("Programs").await?;
         let discriminator_collection = db.collection("Discriminators").await?;
         let instruction_collection = db.collection("Instructions").await?;
@@ -255,7 +280,7 @@ impl GraphDatabase {
         let has_discriminator_collection = db.collection("HasDiscriminator").await?;
         let mapped_to_collection = db.collection("MappedTo").await?;
         let contributed_by_collection = db.collection("ContributedBy").await?;
-        
+
         Ok(GraphDatabase {
             db: Arc::new(db),
             program_collection: Arc::new(program_collection),
@@ -276,6 +301,9 @@ impl GraphDatabase {
         instruction: &str,
         user_id: &str,
     ) -> Result<(), DatabaseError> {
+
+
+
         // Create nodes for the collections
         let program = Program {
             _key: program_id.to_string(),
@@ -303,7 +331,9 @@ impl GraphDatabase {
             self.instruction_collection.create_document(instruction_doc, InsertOptions::builder().overwrite(true).build()),
             self.user_collection.create_document(user, InsertOptions::builder().overwrite(true).build())
         );
+
         
+
         // Check for errors
         res1.map_err(|e| DatabaseError::DocumentInsertionError {
             collection: "Programs".to_string(),
@@ -342,7 +372,7 @@ impl GraphDatabase {
             self.mapped_to_collection.create_document(edge_mapped_to, InsertOptions::builder().overwrite(true).build()),
             self.contributed_by_collection.create_document(edge_contributed_by, InsertOptions::builder().overwrite(true).build())
         );
-        
+
         // Check for errors
         edge_res1.map_err(|e| DatabaseError::DocumentInsertionError {
             collection: "HasDiscriminator".to_string(),
@@ -360,28 +390,57 @@ impl GraphDatabase {
         Ok(())
     }
 
-    // Function to query discriminators from the database
-    pub async fn query_discriminators(&self, program_id: &str) -> Result<Vec<String>, DatabaseError> {
-        let aql = "FOR d IN Discriminators FILTER d._key LIKE @program_id RETURN d.value";
+    // Function to query discriminators and their associated instructions from the database
+    pub async fn query_discriminators_and_instructions(&self, program_id: &str) -> Result<Vec<Discriminator>, DatabaseError> {
+        let aql = "
+        FOR d IN Discriminators
+            FILTER d._key LIKE @program_id
+            LET instructions = (
+                FOR i IN Instructions
+                    FILTER i._key LIKE CONCAT(d._key, '%')
+                    RETURN i
+            )
+            RETURN { discriminator: d, instructions: instructions }
+        ";
         let mut bind_vars = HashMap::new();
-        bind_vars.insert("program_id", format!("{}%", program_id).into()); // Use .into() to convert to Value
+        bind_vars.insert("program_id", format!("{}%", program_id).into());
 
-        let discriminators: Vec<String> = self.db.aql_bind_vars(aql, bind_vars).await
+        let results: Vec<HashMap<String, serde_json::Value>> = self.db.aql_bind_vars(aql, bind_vars).await
             .map_err(|e| DatabaseError::AqlQueryError { query: aql.to_string(), source: e })?;
+
+        let mut discriminators = Vec::new();
+        for result in results {
+            let discriminator: Discriminator = serde_json::from_value(result.get("discriminator").unwrap().clone()).unwrap();
+            let instructions: Vec<Instruction> = serde_json::from_value(result.get("instructions").unwrap().clone()).unwrap();
+            let instruction_map = serde_json::to_string(&instructions).unwrap();
+            discriminators.push(Discriminator {
+                _key: discriminator._key,
+                value: discriminator.value,
+                instruction: instruction_map,
+                user_id: discriminator.user_id,
+            });
+        }
+
         Ok(discriminators)
     }
 
-    // Function to query instructions from the database
-    pub async fn query_instructions(&self, discriminator_id: &str) -> Result<Vec<String>, DatabaseError> {
-        let aql = "FOR i IN Instructions FILTER i._key LIKE @discriminator_id RETURN i.value";
+    // Function to fetch instructions based on a single discriminator
+    pub async fn fetch_instructions_by_discriminator(&self, discriminator_id: &str) -> Result<Vec<Instruction>, DatabaseError> {
+        let aql = "
+        FOR i IN Instructions
+            FILTER i._key LIKE @discriminator_id
+            RETURN i
+        ";
+        
         let mut bind_vars = HashMap::new();
-        bind_vars.insert("discriminator_id", format!("{}%", discriminator_id).into()); // Use .into() to convert to Value
+        // Use `Value::String` to create a serde_json::Value
+        bind_vars.insert("discriminator_id", Value::String(format!("{}%", discriminator_id)));
 
-        let instructions: Vec<String> = self.db.aql_bind_vars(aql, bind_vars).await
+        let instructions: Vec<Instruction> = self.db.aql_bind_vars(aql, bind_vars).await
             .map_err(|e| DatabaseError::AqlQueryError { query: aql.to_string(), source: e })?;
+
         Ok(instructions)
     }
-
     // Function to get all program IDs from the database
     pub async fn get_all_program_ids(&self) -> Result<Vec<String>, DatabaseError> {
         let aql = "FOR p IN Programs RETURN p.id";
@@ -390,34 +449,35 @@ impl GraphDatabase {
         Ok(program_ids)
     }
 
-        // Function to create the required collections if they do not exist
-        pub async fn create_required_collections(&self) -> Result<(), ClientError> {
-            let collections = vec![
-                "Programs", 
-                "Discriminators", 
-                "Instructions", 
-                "Users", 
-                "HasDiscriminator", 
-                "MappedTo", 
-                "ContributedBy"
-            ];
-            
-            for collection_name in collections {
-                let collection = self.db.collection(collection_name).await;
-                if collection.is_err() {
-                    self.db.create_collection(collection_name).await?;
-                }
+    // Function to create the required collections if they do not exist
+    pub async fn create_required_collections(&self) -> Result<(), ClientError> {
+        let collections = vec![
+            "Programs",
+            "Discriminators",
+            "Instructions",
+            "Users",
+            "HasDiscriminator",
+            "MappedTo",
+            "ContributedBy"
+        ];
+
+        for collection_name in collections {
+            let collection = self.db.collection(collection_name).await;
+            if collection.is_err() {
+                self.db.create_collection(collection_name).await?;
             }
-            Ok(())
         }
+        Ok(())
+    }
+
+
+
 }
-
-
-
 
 fn sanitize_key(input: &str) -> String {
     input.replace("/", "_") // Replace invalid characters with underscores or any valid character
 }
+
 
 
 use actix_web::{web, HttpRequest, HttpResponse, Responder};

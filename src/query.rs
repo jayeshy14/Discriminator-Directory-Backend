@@ -1,7 +1,8 @@
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
+use serde_json::json;
 use crate::graph_disc::GraphDatabase;
 use crate::solana_connection::SolanaConnection;
-
+use log::{error, info};
 
 pub async fn query_discriminators_endpoint(
     db: web::Data<GraphDatabase>,
@@ -15,7 +16,7 @@ pub async fn query_discriminators_endpoint(
 
     match discriminators {
         Ok(discriminators) => {
-            if !discriminators.is_empty() {
+            if !discriminators.len() == 0 {
                 HttpResponse::Ok().json(discriminators)
             } else {
                 // If not found in DB, fetch from Solana
@@ -25,18 +26,19 @@ pub async fn query_discriminators_endpoint(
                     Ok(accounts) => {
                         let mut uploaded_any = false;
                         for (pub_key, account) in accounts {
+
+                            let data = &account.data;
                             // Extract the discriminator from account data
-                            let discriminator = &account.data[0..8];
-                            let discriminator_str = hex::encode(discriminator);
-                            let instruction_data = &account.data[0..4];
-                            let instruction = hex::encode(instruction_data); // Converts binary data to a hex string
+                            let discriminator_data = data[0..8].to_vec();
+                            let instruction_data = data[8..].to_vec();
 
                             if let Err(e) = db.upload_discriminator(
                                 &program_id,
-                                &discriminator_str,
-                                &instruction, 
+                                discriminator_data,
+                                instruction_data,
                                 &pub_key.to_string(),
                             ).await {
+                                println!("Error uploading");
                                 return HttpResponse::InternalServerError().body(e.to_string());
                             }
 
@@ -62,18 +64,6 @@ pub async fn query_discriminators_endpoint(
 }
 
 
-pub async fn query_instructions_endpoint(
-    db: web::Data<GraphDatabase>,
-    discriminator_id: web::Path<String>,
-) -> impl Responder {
-    let discriminator_id = discriminator_id.into_inner();
-
-    match db.fetch_instructions_by_discriminator(&discriminator_id).await {
-        Ok(instructions) => HttpResponse::Ok().json(instructions),
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
-    }
-}
-
 pub async fn upload_discriminator_endpoint(
     db: web::Data<GraphDatabase>,
     program_id: web::Path<String>,
@@ -82,21 +72,22 @@ pub async fn upload_discriminator_endpoint(
 ) -> impl Responder {
     let program_id = program_id.into_inner();
     let (discriminator, instruction, _) = discriminator_info.into_inner();
+    info!("Uploading discriminator for program_id: {}", program_id);
 
     // Extract user_id from the headers
     let user_id = match req.headers().get("user_id") {
         Some(value) => match value.to_str() {
             Ok(v) => v.to_string(),
-            Err(_) => return HttpResponse::BadRequest().body("Invalid user_id header value"),
+            Err(_) => return HttpResponse::BadRequest().json(json!({"error": "Invalid user_id header value"})),
         },
-        None => return HttpResponse::BadRequest().body("Missing user_id header"),
+        None => return HttpResponse::BadRequest().json(json!({"error": "Missing user_id header"})),
     };
 
-    match db
-        .upload_discriminator(&program_id, &discriminator, &instruction, &user_id)
-        .await
-    {
-        Ok(_) => HttpResponse::Ok().body("Discriminator uploaded successfully"),
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    match db.upload_discriminator(&program_id, discriminator.into_bytes(), instruction.into_bytes(), &user_id).await {
+        Ok(_) => HttpResponse::Ok().json(json!({"status": "Discriminator uploaded successfully"})),
+        Err(e) => {
+            error!("Error uploading discriminator to DB: {}", e);
+            HttpResponse::InternalServerError().json(json!({"error": "Failed to upload discriminator to DB"}))
+        }
     }
 }

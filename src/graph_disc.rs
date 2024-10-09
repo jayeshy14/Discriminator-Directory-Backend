@@ -1,15 +1,16 @@
 use arangors::client::reqwest::ReqwestClient;
 use arangors::database::Database;
 use arangors::document::options::InsertOptions;
+use arangors::AqlQuery;
 use arangors::Connection;
 use arangors::ClientError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::join;
 use thiserror::Error;
+use sha2::{Digest, Sha256};
 
 // Structs for representing documents in the ArangoDB
 #[derive(Debug, Serialize, Deserialize)]
@@ -18,18 +19,20 @@ pub struct Program {
     id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Discriminator {
     _key: String,
-    value: String,
-    instruction: String,
+    discriminator_id: String,
+    discriminator_data: Vec<u8>,
+    instruction: Instruction,
     user_id: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Instruction {
     _key: String,
-    value: String,
+    instruction_id: String,
+    instruction_data: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -112,6 +115,27 @@ impl GraphDatabase {
         let connection = Connection::establish_jwt(uri, user, password).await?;
         let db = connection.db(db_name).await?;
 
+        let collections = vec![
+            "Programs",
+            "Discriminators",
+            "Instructions",
+            "Users",
+            "HasDiscriminator",
+            "MappedTo",
+            "ContributedBy"
+        ];
+
+        for collection_name in collections {
+            match db.collection(collection_name).await {
+                Ok(_) => println!("Collection '{}' already exists.", collection_name),
+                Err(_) => {
+                    println!("Creating collection '{}'.", collection_name);
+                    db.create_collection(collection_name).await?;
+                    
+                }
+            }
+        }
+
         let program_collection = db.collection("Programs").await?;
         let discriminator_collection = db.collection("Discriminators").await?;
         let instruction_collection = db.collection("Instructions").await?;
@@ -132,32 +156,56 @@ impl GraphDatabase {
         })
     }
 
+    // Function to hash keys
+    fn hash_key(input: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(input);
+        hex::encode(hasher.finalize())
+    }
+
     // Function to upload a discriminator to the database
     pub async fn upload_discriminator(
         &self,
         program_id: &str,
-        discriminator: &str,
-        instruction: &str,
+        discriminator_data: Vec<u8>,
+        instruction_data: Vec<u8>,
         user_id: &str,
     ) -> Result<(), DatabaseError> {
 
+        let discriminator_id = hex::encode(discriminator_data.clone());
+        let instruction_id = hex::encode(instruction_data.clone());
 
-
-        // Create nodes for the collections
         let program = Program {
             _key: program_id.to_string(),
             id: program_id.to_string(),
         };
+
+        let discriminator_key = format!("{}_{}", program_id, discriminator_id);
+        let instruction_key = format!("{}_{}", program_id, Self::hash_key(&instruction_id));
+
+        // Debug logs to print the keys
+        println!("Program key: {}", program._key);
+        println!("Discriminator key: {}", discriminator_key);
+        println!("Instruction key: {}", instruction_key);
+
         let discriminator_doc = Discriminator {
-            _key: sanitize_key(&format!("{}_{}", program_id, discriminator)),
-            value: discriminator.to_string(),
-            instruction: instruction.to_string(),
+            _key: discriminator_key.clone(),
+            discriminator_id: discriminator_id.clone(),
+            discriminator_data: discriminator_data.clone(),
+            instruction: Instruction {
+                _key: instruction_key.clone(),
+                instruction_id: instruction_id.clone(),
+                instruction_data: instruction_data.clone(),
+            },
             user_id: user_id.to_string(),
         };
+
         let instruction_doc = Instruction {
-            _key: sanitize_key(&format!("{}_{}", program_id, instruction)),
-            value: instruction.to_string(),
+            _key: instruction_key.clone(),
+            instruction_id: instruction_id.clone(),
+            instruction_data: instruction_data.clone(),
         };
+
         let user = User {
             _key: user_id.to_string(),
             id: user_id.to_string(),
@@ -170,8 +218,6 @@ impl GraphDatabase {
             self.instruction_collection.create_document(instruction_doc, InsertOptions::builder().overwrite(true).build()),
             self.user_collection.create_document(user, InsertOptions::builder().overwrite(true).build())
         );
-
-        
 
         // Check for errors
         res1.map_err(|e| DatabaseError::DocumentInsertionError {
@@ -191,19 +237,21 @@ impl GraphDatabase {
             source: e,
         })?;
 
+
         // Create edges for the graph
         let edge_has_discriminator = HasDiscriminator {
             _from: format!("Programs/{}", program_id),
-            _to: format!("Discriminators/{}_{}", program_id, discriminator),
+            _to: format!("Discriminators/{}", discriminator_key.clone()),
         };
         let edge_mapped_to = MappedTo {
-            _from: format!("Discriminators/{}_{}", program_id, discriminator),
-            _to: format!("Instructions/{}_{}", program_id, instruction),
+            _from: format!("Discriminators/{}", discriminator_key),
+            _to: format!("Instructions/{}", instruction_key.clone()),
         };
         let edge_contributed_by = ContributedBy {
-            _from: format!("Discriminators/{}_{}", program_id, discriminator),
+            _from: format!("Discriminators/{}", discriminator_key),
             _to: format!("Users/{}", user_id),
         };
+
 
         // Insert edges concurrently
         let (edge_res1, edge_res2, edge_res3) = join!(
@@ -229,57 +277,42 @@ impl GraphDatabase {
         Ok(())
     }
 
-    // Function to query discriminators and their associated instructions from the database
+    // Function to query discriminators and their instructions by program ID
     pub async fn query_discriminators_and_instructions(&self, program_id: &str) -> Result<Vec<Discriminator>, DatabaseError> {
         let aql = "
         FOR d IN Discriminators
             FILTER d._key LIKE @program_id
-            LET instructions = (
-                FOR i IN Instructions
-                    FILTER i._key LIKE CONCAT(d._key, '%')
-                    RETURN i
-            )
-            RETURN { discriminator: d, instructions: instructions }
+            RETURN {discriminator: d}
         ";
+
         let mut bind_vars = HashMap::new();
         bind_vars.insert("program_id", format!("{}%", program_id).into());
 
-        let results: Vec<HashMap<String, serde_json::Value>> = self.db.aql_bind_vars(aql, bind_vars).await
+        let results: Vec<HashMap<String, Discriminator>> = self.db.aql_bind_vars(aql, bind_vars).await
             .map_err(|e| DatabaseError::AqlQueryError { query: aql.to_string(), source: e })?;
 
         let mut discriminators = Vec::new();
         for result in results {
-            let discriminator: Discriminator = serde_json::from_value(result.get("discriminator").unwrap().clone()).unwrap();
-            let instructions: Vec<Instruction> = serde_json::from_value(result.get("instructions").unwrap().clone()).unwrap();
-            let instruction_map = serde_json::to_string(&instructions).unwrap();
+            let discriminator: &Discriminator = match result.get("discriminator") {
+                Some(discriminator) => &discriminator.clone(),
+                None => {
+                    panic!("Discriminator not found");
+                }
+            };
+
             discriminators.push(Discriminator {
-                _key: discriminator._key,
-                value: discriminator.value,
-                instruction: instruction_map,
-                user_id: discriminator.user_id,
+                _key: discriminator._key.clone(),
+                discriminator_id: discriminator.discriminator_id.clone(),
+                instruction: discriminator.instruction.clone(),
+                discriminator_data: discriminator.discriminator_data.clone(),
+                user_id: discriminator.user_id.clone(),
             });
         }
 
         Ok(discriminators)
     }
 
-    // Function to fetch instructions based on a single discriminator
-    pub async fn fetch_instructions_by_discriminator(&self, discriminator_id: &str) -> Result<Vec<Instruction>, DatabaseError> {
-        let aql = "
-        FOR i IN Instructions
-            FILTER i._key LIKE @discriminator_id
-            RETURN i
-        ";
-        
-        let mut bind_vars = HashMap::new();
-        // Use `Value::String` to create a serde_json::Value
-        bind_vars.insert("discriminator_id", Value::String(format!("{}%", discriminator_id)));
-
-        let instructions: Vec<Instruction> = self.db.aql_bind_vars(aql, bind_vars).await
-            .map_err(|e| DatabaseError::AqlQueryError { query: aql.to_string(), source: e })?;
-
-        Ok(instructions)
-    }
+    
     // Function to get all program IDs from the database
     pub async fn get_all_program_ids(&self) -> Result<Vec<String>, DatabaseError> {
         let aql = "FOR p IN Programs RETURN p.id";
@@ -287,33 +320,4 @@ impl GraphDatabase {
             .map_err(|e| DatabaseError::AqlQueryError { query: aql.to_string(), source: e })?;
         Ok(program_ids)
     }
-
-    // Function to create the required collections if they do not exist
-    pub async fn create_required_collections(&self) -> Result<(), ClientError> {
-        let collections = vec![
-            "Programs",
-            "Discriminators",
-            "Instructions",
-            "Users",
-            "HasDiscriminator",
-            "MappedTo",
-            "ContributedBy"
-        ];
-
-        for collection_name in collections {
-            let collection = self.db.collection(collection_name).await;
-            if collection.is_err() {
-                self.db.create_collection(collection_name).await?;
-            }
-        }
-        Ok(())
-    }
-
-
-
 }
-
-fn sanitize_key(input: &str) -> String {
-    input.replace("/", "_") // Replace invalid characters with underscores or any valid character
-}
-
